@@ -1,0 +1,12 @@
+config NET_VENDOR_JANIS
+	bool "janis device"
+	default y
+
+if NET_VENDOR_JANIS
+
+config JANIS_ETH
+	tristate "janis eth driver"
+	help
+	    janis toy driver for e1000 nic on qemu machine
+
+endif
