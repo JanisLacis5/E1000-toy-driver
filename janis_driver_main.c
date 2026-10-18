@@ -16,17 +16,19 @@ struct janis_private {
 
 static irqreturn_t janis_irq(int i, void *data)
 {
+	printk("janis_irq(%i, %p)", i, data);
 	return IRQ_HANDLED;
 }
 
 static netdev_tx_t janis_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	printk("JANIS DRIVER XMIT");
+	printk("janis_xmit(%p, %p)", skb, dev);
 	return NETDEV_TX_OK;
 }
 
 static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+	printk("janis_probe(%p, %p)", pdev, id);
 	struct net_device *netdev;
 	int err;
 
@@ -69,6 +71,7 @@ err_clean_netdev:
 
 static void janis_remove(struct pci_dev *pdev)
 {
+	printk("janis_remove(%p)", pdev);
 	struct net_device *netdev = pci_get_drvdata(pdev);
 
 	free_netdev(netdev);
