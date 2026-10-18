@@ -36,35 +36,45 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!netdev)
 		return -ENOMEM;
 
+	SET_NETDEV_DEV(netdev, &pdev->dev);
 	pci_set_drvdata(pdev, netdev);
 
 	err = pci_enable_device(pdev);
+	printk("pci_enable_device err: %d", err);
 	if (err)
 		goto err_clean_netdev;
 
 	pci_set_master(pdev);
 
 	err = pci_request_regions(pdev, DRIVER_NAME);
+	printk("pci_request_regions err: %d", err);
 	if (err)
 		goto clear_master;
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	printk("dma_set_mask_and_coherent err: %d", err);
 	if (err)
 		goto release_region;
 
-	// TODO: maybe some registers on the nic need to be initialized / reset or smth like that
+	// TODO: maybe some registers on the nic need to be initialized / reset or smth like that (io mappings for example)
 
-	err = request_irq(pdev->irq, janis_irq, 0, DRIVER_NAME, netdev);
+	printk("before request_irq");
+	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, DRIVER_NAME,
+			  netdev);
+	printk("request_irq err: %d", err);
 	if (err)
 		goto release_region;
 
 	return 0;
 
 release_region:
+	printk("goto release_region");
 	pci_release_regions(pdev);
 clear_master:
+	printk("goto clear_master");
 	pci_clear_master(pdev);
 err_clean_netdev:
+	printk("goto err_clean_netdev");
 	free_netdev(netdev);
 	return err;
 }
@@ -74,9 +84,12 @@ static void janis_remove(struct pci_dev *pdev)
 	printk("janis_remove(%p)", pdev);
 	struct net_device *netdev = pci_get_drvdata(pdev);
 
-	free_netdev(netdev);
-	pci_clear_master(pdev);
+	// TODO: stop interrupts from the device first
+	free_irq(pdev->irq, pdev);
+	// TODO: stop all dma operations from the device
+	pci_release_regions(pdev);
 	pci_disable_device(pdev);
+	free_netdev(netdev);
 }
 
 static const struct net_device_ops janis_netdev_ops = {
