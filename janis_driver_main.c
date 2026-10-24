@@ -12,6 +12,7 @@
 #define DRIVER_NAME "janis-toy-driver"
 #define JANIS_BAR_L 0
 #define JANIS_BAR_H 1
+#define JANIS_TMP_BUF_SIZE 256
 #define JANIS_REG_SPACE_SIZE 0x20000 // 128kb
 
 // TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
@@ -66,18 +67,23 @@ static int janis_read_eeprom_word(void __iomem *base, u8 addr, u16 *ret)
 	return 0;
 }
 
-static int janis_read_eeprom_mac(void __iomem *base, u8 addr, u8 *ret)
+/* n should be even */
+static int janis_read_eeprom_n_bytes(void __iomem *base, u8 addr, u16 n,
+				     u8 *ret)
 {
-	u16 words[3];
+	if (n > JANIS_TMP_BUF_SIZE || (n & 1) != 0)
+		return -EINVAL;
+
+	u16 words[JANIS_TMP_BUF_SIZE];
 	int err;
 
-	for (int i = 0; i < ETH_ALEN / 2; i++) {
+	for (int i = 0; i < n / 2; i++) {
 		err = janis_read_eeprom_word(base, addr + i, &words[i]);
 		if (err)
 			return err;
 	}
 
-	for (int i = 0; i < ETH_ALEN / 2; i++) {
+	for (int i = 0; i < n / 2; i++) {
 		ret[2 * i] = words[i] & 0xff;
 		ret[2 * i + 1] = words[i] >> 8;
 	}
@@ -85,15 +91,21 @@ static int janis_read_eeprom_mac(void __iomem *base, u8 addr, u8 *ret)
 	return 0;
 }
 
-static int janis_read_eeprom_ip4(void __iomem *base, u8 addr, __be32 *res)
+static int janis_read_eeprom_mac(void __iomem *base, u8 addr, u8 *ret)
 {
-	return 0;
+	return janis_read_eeprom_n_bytes(base, addr, ETH_ALEN, ret);
+}
+
+static int janis_read_eeprom_ip4(void __iomem *base, u8 addr, __be32 *ret)
+{
+	return janis_read_eeprom_n_bytes(base, addr, sizeof(__be32), (u8 *)ret);
 }
 
 static int janis_read_eeprom_ip6(void __iomem *base, u8 addr,
-				 struct in6_addr *res)
+				 struct in6_addr *ret)
 {
-	return 0;
+	return janis_read_eeprom_n_bytes(base, addr, sizeof(struct in6_addr),
+					 (u8 *)ret);
 }
 
 static irqreturn_t janis_irq(int i, void *data)
