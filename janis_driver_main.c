@@ -2,6 +2,7 @@
 #include <linux/etherdevice.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/iopoll.h>
 
 /*
    The driver is built for Intel's 82540EM Gigabit Ethernet Controller 
@@ -50,17 +51,19 @@ enum regs {
 	REG_EERD = 0x14,
 };
 
-static u16 janis_read_eeprom_word(void __iomem *base, u8 addr)
+static int janis_read_eeprom_word(void __iomem *base, u8 addr, u16 *ret)
 {
-	u32 eerd_cont = 0;
+	u32 eerd_value;
 
 	u32 to_write = (addr << 8) | 1;
 	writel(to_write, base + REG_EERD);
 
-	// TODO: add timeout for this loop
-	while (!(eerd_cont & (1u << 4)))
-		eerd_cont = readl(base + REG_EERD);
-	return eerd_cont >> 16;
+	if (readl_poll_timeout(base + REG_EERD, eerd_value,
+			       eerd_value & (1u << 4), 0, 100))
+		return -ETIMEDOUT;
+
+	*ret = eerd_value >> 0x10;
+	return 0;
 }
 
 // static int janis_read_eeprom_ip4(u8 addr, __be32 *res)
@@ -108,14 +111,12 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pci_set_drvdata(pdev, netdev);
 
 	err = pci_enable_device(pdev);
-	printk("pci_enable_device err: %d\n", err);
 	if (err)
 		goto err_clean_netdev;
 
 	pci_set_master(pdev);
 
 	err = pci_request_regions(pdev, DRIVER_NAME);
-	printk("pci_request_regions err: %d\n", err);
 	if (err)
 		goto clear_master;
 
@@ -142,18 +143,18 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	jpriv->regs = regs;
 
 	/* populate eeprom data in private data */
-	u16 device_id = janis_read_eeprom_word(regs, 0x0D);
-	printk("device_id from eeprom: %d", device_id);
+	u16 device_id;
+	err = janis_read_eeprom_word(regs, 0x0D, &device_id);
+	if (err)
+		goto release_region;
+	printk("device id from eeprom: 0x%04x\n", device_id);
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-	printk("dma_set_mask_and_coherent err: %d\n", err);
 	if (err)
 		goto release_region;
 
-	printk("doing request_irq with name: %s", netdev->name);
 	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name,
 			  netdev);
-	printk("request_irq err: %d\n", err);
 	if (err)
 		goto release_region;
 
