@@ -9,9 +9,12 @@
 */
 
 #define DRIVER_NAME "janis-toy-driver"
+#define JANIS_BAR_L 0
+#define JANIS_BAR_H 1
+#define JANIS_REG_SPACE_SIZE 0x20000 // 128kb
 
 struct janis_private {
-	struct net_device *netdev;
+	void __iomem *regs;
 };
 
 static irqreturn_t janis_irq(int i, void *data)
@@ -33,13 +36,17 @@ static const struct net_device_ops janis_netdev_ops = {
 static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	printk("janis_probe(%p, %p)\n", pdev, id);
+	struct janis_private *priv;
 	struct net_device *netdev;
+	resource_size_t pciaddr;
+	void __iomem *regs;
 	int err;
 
 	netdev = alloc_etherdev(sizeof(struct janis_private));
 	if (!netdev)
 		return -ENOMEM;
 	netdev->netdev_ops = &janis_netdev_ops;
+	priv = netdev_priv(netdev);
 
 	SET_NETDEV_DEV(netdev, &pdev->dev);
 	pci_set_drvdata(pdev, netdev);
@@ -56,12 +63,32 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto clear_master;
 
+	/* gets they pyhsical addresses */
+	pciaddr = pci_resource_start(pdev, JANIS_BAR_L);
+	if (!pciaddr) {
+		printk(KERN_ERR "no mmio resources");
+		err = -EIO;
+		goto clear_master;
+	}
+	if (pci_resource_len(pdev, JANIS_BAR_L) < JANIS_REG_SPACE_SIZE) {
+		printk(KERN_ERR "not enough room for registers");
+		err = -EIO;
+		goto clear_master;
+	}
+
+	/* assigns virtual ones so they are accessable */
+	regs = ioremap(pciaddr, JANIS_REG_SPACE_SIZE);
+	if (!regs) {
+		err = -EIO;
+		printk(KERN_ERR "failed to map mmio");
+		goto clear_master;
+	}
+	priv->regs = regs;
+
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	printk("dma_set_mask_and_coherent err: %d\n", err);
 	if (err)
 		goto release_region;
-
-	// TODO: maybe some registers on the nic need to be initialized / reset or smth like that (io mappings for example)
 
 	printk("doing request_irq with name: %s", netdev->name);
 	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name,
@@ -73,13 +100,11 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	return 0;
 
 release_region:
-	printk("goto release_region\n");
+	iounmap(regs);
 	pci_release_regions(pdev);
 clear_master:
-	printk("goto clear_master\n");
 	pci_clear_master(pdev);
 err_clean_netdev:
-	printk("goto err_clean_netdev\n");
 	free_netdev(netdev);
 	return err;
 }
@@ -88,10 +113,13 @@ static void janis_remove(struct pci_dev *pdev)
 {
 	printk("janis_remove(%p)\n", pdev);
 	struct net_device *netdev = pci_get_drvdata(pdev);
+	struct janis_private *priv = netdev_priv(netdev);
 
 	// TODO: stop interrupts from the device first
 	free_irq(pdev->irq, netdev);
 	// TODO: stop all dma operations from the device
+	if (priv->regs)
+		iounmap(priv->regs);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
 	free_netdev(netdev);
