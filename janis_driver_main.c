@@ -66,15 +66,35 @@ static int janis_read_eeprom_word(void __iomem *base, u8 addr, u16 *ret)
 	return 0;
 }
 
-// static int janis_read_eeprom_ip4(u8 addr, __be32 *res)
-// {
-// 	return 0;
-// }
-//
-// static int janis_read_eeprom_ip6(u8 addr, struct in6_addr *res)
-// {
-// 	return 0;
-// }
+static int janis_read_eeprom_mac(void __iomem *base, u8 addr, u8 *ret)
+{
+	u16 words[3];
+	int err;
+
+	for (int i = 0; i < ETH_ALEN / 2; i++) {
+		err = janis_read_eeprom_word(base, addr + i, &words[i]);
+		if (err)
+			return err;
+	}
+
+	for (int i = 0; i < ETH_ALEN / 2; i++) {
+		ret[2 * i] = words[i] & 0xff;
+		ret[2 * i + 1] = words[i] >> 8;
+	}
+
+	return 0;
+}
+
+static int janis_read_eeprom_ip4(void __iomem *base, u8 addr, __be32 *res)
+{
+	return 0;
+}
+
+static int janis_read_eeprom_ip6(void __iomem *base, u8 addr,
+				 struct in6_addr *res)
+{
+	return 0;
+}
 
 static irqreturn_t janis_irq(int i, void *data)
 {
@@ -143,11 +163,20 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	jpriv->regs = regs;
 
 	/* populate eeprom data in private data */
-	u16 device_id;
-	err = janis_read_eeprom_word(regs, 0x0D, &device_id);
+	err = janis_read_eeprom_mac(regs, 0, jpriv->mac_addr);
 	if (err)
 		goto release_region;
-	printk("device id from eeprom: 0x%04x\n", device_id);
+	pr_info("eeprom MAC: %pM\n", jpriv->mac_addr);
+
+	err = janis_read_eeprom_ip4(regs, 0x25, &jpriv->ipv4);
+	if (err)
+		goto release_region;
+	pr_info("eeprom IPv4: %pI4\n", &jpriv->ipv4);
+
+	err = janis_read_eeprom_ip6(regs, 0x27, &jpriv->ipv6);
+	if (err)
+		goto release_region;
+	pr_info("eeprom IPv6: %pI6c\n", &jpriv->ipv6);
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err)
