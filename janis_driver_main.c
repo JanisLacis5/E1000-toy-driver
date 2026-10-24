@@ -13,9 +13,65 @@
 #define JANIS_BAR_H 1
 #define JANIS_REG_SPACE_SIZE 0x20000 // 128kb
 
+// TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
+
 struct janis_private {
 	void __iomem *regs;
+
+	/* EEPROM data. noone outside the driver is allowed to update it. 
+	   if it is needd for some reason, helpers should be implemented here */
+	u8 mac_addr[ETH_ALEN];
+	u16 compatability[4];
+	u32 pba;
+	u16 init_ctrl1;
+	u16 init_ctrl2;
+	u8 common_pwr;
+	u16 circuit_ctrl;
+	u8 d3_pwr;
+	u8 d0_pwr;
+	u16 mgmt_ctrl;
+	u8 smbus_addr;
+	u8 init_ctrl3;
+	__be32 ipv4;
+	struct in6_addr ipv6;
+	u8 led_ctrl;
+	u16 checksum;
 };
+
+#define read8(pos) readb((jpriv->regs) + (pos))
+#define read16(pos) readw((jpriv->regs) + (pos))
+#define read32(pos) readl((jpriv->regs) + (pos))
+#define write8(pos) writeb((jpriv->regs) + (pos))
+#define write16(pos) writew((jpriv->regs) + (pos))
+#define write32(pos) writel((jpriv->regs) + (pos))
+
+enum regs {
+	REG_EECD = 0x10,
+	REG_EERD = 0x14,
+};
+
+static u16 janis_read_eeprom_word(void __iomem *base, u8 addr)
+{
+	u32 eerd_cont = 0;
+
+	u32 to_write = (addr << 8) | 1;
+	writel(to_write, base + REG_EERD);
+
+	// TODO: add timeout for this loop
+	while (!(eerd_cont & (1u << 4)))
+		eerd_cont = readl(base + REG_EERD);
+	return eerd_cont >> 16;
+}
+
+// static int janis_read_eeprom_ip4(u8 addr, __be32 *res)
+// {
+// 	return 0;
+// }
+//
+// static int janis_read_eeprom_ip6(u8 addr, struct in6_addr *res)
+// {
+// 	return 0;
+// }
 
 static irqreturn_t janis_irq(int i, void *data)
 {
@@ -36,7 +92,7 @@ static const struct net_device_ops janis_netdev_ops = {
 static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	printk("janis_probe(%p, %p)\n", pdev, id);
-	struct janis_private *priv;
+	struct janis_private *jpriv;
 	struct net_device *netdev;
 	resource_size_t pciaddr;
 	void __iomem *regs;
@@ -46,7 +102,7 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!netdev)
 		return -ENOMEM;
 	netdev->netdev_ops = &janis_netdev_ops;
-	priv = netdev_priv(netdev);
+	jpriv = netdev_priv(netdev);
 
 	SET_NETDEV_DEV(netdev, &pdev->dev);
 	pci_set_drvdata(pdev, netdev);
@@ -63,7 +119,7 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto clear_master;
 
-	/* gets they pyhsical addresses */
+	/* gets pyhsical addresses */
 	pciaddr = pci_resource_start(pdev, JANIS_BAR_L);
 	if (!pciaddr) {
 		printk(KERN_ERR "no mmio resources");
@@ -83,7 +139,11 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		printk(KERN_ERR "failed to map mmio");
 		goto clear_master;
 	}
-	priv->regs = regs;
+	jpriv->regs = regs;
+
+	/* populate eeprom data in private data */
+	u16 device_id = janis_read_eeprom_word(regs, 0x0D);
+	printk("device_id from eeprom: %d", device_id);
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	printk("dma_set_mask_and_coherent err: %d\n", err);
@@ -113,13 +173,13 @@ static void janis_remove(struct pci_dev *pdev)
 {
 	printk("janis_remove(%p)\n", pdev);
 	struct net_device *netdev = pci_get_drvdata(pdev);
-	struct janis_private *priv = netdev_priv(netdev);
+	struct janis_private *jpriv = netdev_priv(netdev);
 
 	// TODO: stop interrupts from the device first
 	free_irq(pdev->irq, netdev);
 	// TODO: stop all dma operations from the device
-	if (priv->regs)
-		iounmap(priv->regs);
+	if (jpriv->regs)
+		iounmap(jpriv->regs);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
 	free_netdev(netdev);
