@@ -1,8 +1,10 @@
+#include "linux/in6.h"
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/iopoll.h>
+#include <linux/string.h>
 
 /*
    The driver is built for Intel's 82540EM Gigabit Ethernet Controller 
@@ -14,6 +16,7 @@
 #define JANIS_BAR_H 1
 #define JANIS_TMP_BUF_SIZE 256
 #define JANIS_REG_SPACE_SIZE 0x20000 // 128kb
+#define JANIS_EEPROM_SIZE_WORDS 0x100
 
 // TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
 
@@ -24,7 +27,7 @@ struct janis_private {
 	   if it is needd for some reason, helpers should be implemented here */
 	u8 mac_addr[ETH_ALEN];
 	u16 compatability[4];
-	u32 pba;
+	u32 pba; // [3rd byte][4th byte][1st byte][2nd byte]
 	u16 init_ctrl1;
 	u16 init_ctrl2;
 	u8 common_pwr;
@@ -67,45 +70,45 @@ static int janis_read_eeprom_word(void __iomem *base, u8 addr, u16 *ret)
 	return 0;
 }
 
-/* n should be even */
-static int janis_read_eeprom_n_bytes(void __iomem *base, u8 addr, u16 n,
-				     u8 *ret)
+static int janis_eeprom_to_priv(void __iomem *base, struct janis_private *jpriv)
 {
-	if (n > JANIS_TMP_BUF_SIZE || (n & 1) != 0)
-		return -EINVAL;
-
-	u16 words[JANIS_TMP_BUF_SIZE];
+	u16 eeprom[JANIS_EEPROM_SIZE_WORDS];
+	u8 *ip4 = (u8 *)&jpriv->ipv4;
 	int err;
 
-	for (int i = 0; i < n / 2; i++) {
-		err = janis_read_eeprom_word(base, addr + i, &words[i]);
+	for (int i = 0; i < JANIS_EEPROM_SIZE_WORDS; i++) {
+		err = janis_read_eeprom_word(base, i, &eeprom[i]);
 		if (err)
 			return err;
 	}
 
-	for (int i = 0; i < n / 2; i++) {
-		ret[2 * i] = words[i] & 0xff;
-		ret[2 * i + 1] = words[i] >> 8;
+	for (int i = 0; i < ETH_ALEN / 2; i++) {
+		jpriv->mac_addr[2 * i] = eeprom[i] & 0xff;
+		jpriv->mac_addr[2 * i + 1] = eeprom[i] >> 8;
 	}
+	memcpy(jpriv->compatability, &eeprom[0x03], 4);
+	jpriv->pba = (eeprom[0x09] << 16) | eeprom[0x08];
+	jpriv->init_ctrl1 = eeprom[0x0A];
+	jpriv->init_ctrl2 = eeprom[0x0F];
+	jpriv->common_pwr = eeprom[0x12];
+	jpriv->circuit_ctrl = eeprom[0x21];
+	jpriv->d3_pwr = eeprom[0x22] & 0xff;
+	jpriv->d0_pwr = eeprom[0x22] >> 8;
+	jpriv->mgmt_ctrl = eeprom[0x23];
+	jpriv->smbus_addr = eeprom[0x24] & 0xff;
+	jpriv->init_ctrl3 = eeprom[0x24] >> 8;
+	for (int i = 0; i < sizeof(__be32) / 2; i++) {
+		ip4[2 * i] = eeprom[0x25 + i] & 0xff;
+		ip4[2 * i + 1] = (eeprom[0x25 + i] >> 8);
+	}
+	for (int i = 0; i < sizeof(jpriv->ipv6) / 2; i++) {
+		jpriv->ipv6.s6_addr[2 * i] = eeprom[0x27 + i] & 0xff;
+		jpriv->ipv6.s6_addr[2 * i + 1] = (eeprom[0x27 + i] >> 8);
+	}
+	jpriv->led_ctrl = eeprom[0x2F];
+	jpriv->checksum = 0; // TODO
 
 	return 0;
-}
-
-static int janis_read_eeprom_mac(void __iomem *base, u8 addr, u8 *ret)
-{
-	return janis_read_eeprom_n_bytes(base, addr, ETH_ALEN, ret);
-}
-
-static int janis_read_eeprom_ip4(void __iomem *base, u8 addr, __be32 *ret)
-{
-	return janis_read_eeprom_n_bytes(base, addr, sizeof(__be32), (u8 *)ret);
-}
-
-static int janis_read_eeprom_ip6(void __iomem *base, u8 addr,
-				 struct in6_addr *ret)
-{
-	return janis_read_eeprom_n_bytes(base, addr, sizeof(struct in6_addr),
-					 (u8 *)ret);
 }
 
 static irqreturn_t janis_irq(int i, void *data)
@@ -174,21 +177,9 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 	jpriv->regs = regs;
 
-	/* populate eeprom data in private data */
-	err = janis_read_eeprom_mac(regs, 0, jpriv->mac_addr);
+	err = janis_eeprom_to_priv(regs, jpriv);
 	if (err)
 		goto io_unmap;
-	pr_info("eeprom MAC: %pM\n", jpriv->mac_addr);
-
-	err = janis_read_eeprom_ip4(regs, 0x25, &jpriv->ipv4);
-	if (err)
-		goto io_unmap;
-	pr_info("eeprom IPv4: %pI4\n", &jpriv->ipv4);
-
-	err = janis_read_eeprom_ip6(regs, 0x27, &jpriv->ipv6);
-	if (err)
-		goto io_unmap;
-	pr_info("eeprom IPv6: %pI6c\n", &jpriv->ipv6);
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err)
