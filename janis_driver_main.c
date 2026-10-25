@@ -157,12 +157,12 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!pciaddr) {
 		printk(KERN_ERR "no mmio resources");
 		err = -EIO;
-		goto clear_master;
+		goto release_region;
 	}
 	if (pci_resource_len(pdev, JANIS_BAR_L) < JANIS_REG_SPACE_SIZE) {
 		printk(KERN_ERR "not enough room for registers");
 		err = -EIO;
-		goto clear_master;
+		goto release_region;
 	}
 
 	/* assigns virtual ones so they are accessable */
@@ -170,39 +170,40 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!regs) {
 		err = -EIO;
 		printk(KERN_ERR "failed to map mmio");
-		goto clear_master;
+		goto release_region;
 	}
 	jpriv->regs = regs;
 
 	/* populate eeprom data in private data */
 	err = janis_read_eeprom_mac(regs, 0, jpriv->mac_addr);
 	if (err)
-		goto release_region;
+		goto io_unmap;
 	pr_info("eeprom MAC: %pM\n", jpriv->mac_addr);
 
 	err = janis_read_eeprom_ip4(regs, 0x25, &jpriv->ipv4);
 	if (err)
-		goto release_region;
+		goto io_unmap;
 	pr_info("eeprom IPv4: %pI4\n", &jpriv->ipv4);
 
 	err = janis_read_eeprom_ip6(regs, 0x27, &jpriv->ipv6);
 	if (err)
-		goto release_region;
+		goto io_unmap;
 	pr_info("eeprom IPv6: %pI6c\n", &jpriv->ipv6);
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err)
-		goto release_region;
+		goto io_unmap;
 
 	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name,
 			  netdev);
 	if (err)
-		goto release_region;
+		goto io_unmap;
 
 	return 0;
 
-release_region:
+io_unmap:
 	iounmap(regs);
+release_region:
 	pci_release_regions(pdev);
 clear_master:
 	pci_clear_master(pdev);
