@@ -1,3 +1,4 @@
+#include "linux/if_ether.h"
 #include "linux/in6.h"
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -14,6 +15,7 @@
 #define DRIVER_NAME "janis-toy-driver"
 #define JANIS_BAR_L 0
 #define JANIS_BAR_H 1
+#define JANIS_MAX_MTU 1500
 #define JANIS_TMP_BUF_SIZE 256
 #define JANIS_REG_SPACE_SIZE 0x20000 // 128kb
 #define JANIS_EEPROM_SIZE_WORDS 0x100
@@ -153,7 +155,7 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	err = pci_request_regions(pdev, DRIVER_NAME);
 	if (err)
-		goto clear_master;
+		goto disable_dev;
 
 	/* gets pyhsical addresses */
 	pciaddr = pci_resource_start(pdev, JANIS_BAR_L);
@@ -181,10 +183,21 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto io_unmap;
 
+	/* set up net device */
+	eth_hw_addr_set(netdev, jpriv->mac_addr);
+	netdev->min_mtu = ETH_MIN_MTU;
+	netdev->max_mtu = JANIS_MAX_MTU;
+
+	err = register_netdev(netdev);
+	if (err)
+		goto io_unmap;
+
+	/* set up dma stuff (TODO) */
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err)
 		goto io_unmap;
 
+	/* set up interrups (TODO) */
 	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name,
 			  netdev);
 	if (err)
@@ -196,8 +209,9 @@ io_unmap:
 	iounmap(regs);
 release_region:
 	pci_release_regions(pdev);
-clear_master:
+disable_dev:
 	pci_clear_master(pdev);
+	pci_disable_device(pdev);
 err_clean_netdev:
 	free_netdev(netdev);
 	return err;
