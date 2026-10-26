@@ -22,6 +22,15 @@
 
 // TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
 
+struct rx_desc {
+	__le64 addr;
+	__le16 len;
+	__le16 checksum;
+	u8 status;
+	u8 errors;
+	__le16 special;
+};
+
 struct janis_private {
 	void __iomem *regs;
 
@@ -43,6 +52,8 @@ struct janis_private {
 	struct in6_addr ipv6;
 	u8 led_ctrl;
 	u16 checksum;
+
+	dma_addr_t dma_handle;
 };
 
 #define read8(pos) readb((jpriv->regs) + (pos))
@@ -116,13 +127,13 @@ static int janis_eeprom_to_priv(void __iomem *base, struct janis_private *jpriv)
 static irqreturn_t janis_irq(int i, void *data)
 {
 	printk("janis_irq(%i, %p)\n", i, data);
-	return IRQ_HANDLED;
+	return IRQ_NONE;
 }
 
 static netdev_tx_t janis_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	printk("janis_xmit(%p, %p)\n", skb, dev);
-	return NETDEV_TX_OK;
+	return NETDEV_TX_BUSY;
 }
 
 static const struct net_device_ops janis_netdev_ops = {
@@ -193,9 +204,13 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto io_unmap;
 
 	/* set up dma stuff (TODO) */
+	// see https://docs.kernel.org/core-api/dma-api-howto.html
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-	if (err)
+	if (err) {
+		dev_warn(&pdev->dev,
+			 "janis_e1000: No suitable DMA available\n");
 		goto io_unmap;
+	}
 
 	/* set up interrups (TODO) */
 	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name,
