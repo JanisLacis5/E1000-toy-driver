@@ -39,9 +39,17 @@ struct janis_rx_desc {
 };
 
 // TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
+#define JANIS_RX_RING_SIZE 64
+#define JANIS_RX_BUF_SIZE  JANIS_MAX_MTU + ETH_HLEN + 8
 struct janis_private {
+	struct net_device *netdev;
+	struct pci_dev *pdev;
 	void __iomem *regs;
 	u32 msg_enable;
+
+	int rx_ring_size;
+	struct janis_rx_desc *rx_ring;
+	struct sk_buff *rx_skb[JANIS_RX_RING_SIZE];
 
 	/* EEPROM data. noone outside the driver is allowed to update it. 
 	   if it is needd for some reason, helpers should be implemented here */
@@ -74,9 +82,17 @@ struct janis_private {
 #define write32(val, pos) writel((val), (jpriv->regs) + (pos))
 
 enum regs {
-	REG_EECD = 0x10,
-	REG_EERD = 0x14,
-	REG_IMS	 = 0xD0,
+	REG_CTRL  = 0x0,
+	REG_EERD  = 0x14,
+	REG_IMS	  = 0xD0,
+	REG_RCTL  = 0x100,
+	REG_RDBAL = 0x2800,
+	REG_RDBAH = 0x2804,
+	REG_RDLEN = 0x2808,
+	REG_RDH	  = 0x2810,
+	REG_RDT	  = 0x2818,
+	REG_RAL	  = 0x5400,
+	REG_RAH	  = 0x5404,
 };
 
 enum irqs {
@@ -166,6 +182,67 @@ static void janis_setup_irqs(struct janis_private *jpriv)
 	write32(ims, REG_IMS);
 }
 
+static void janis_setup_regs(struct janis_private *jpriv)
+{
+	u32 macl = 0;
+	u16 mach = jpriv->mac_addr[4] | (jpriv->mac_addr[5] << 8);
+	for (int i = 0; i < 4; i++) {
+		macl |= (u32)jpriv->mac_addr[i] << (8 * i);
+	}
+	u32 ctrl = read32(REG_CTRL);
+
+	write32(0b11110, REG_RCTL);
+	write32(0x0, REG_RDH);
+	write32(0x1, REG_RDT);
+	write32(macl, REG_RAL);
+	write32(mach, REG_RAH);
+	write32(jpriv->dma_handle & 0xffffffff, REG_RDBAL);
+	write32(jpriv->dma_handle >> 32, REG_RDBAH);
+	write32(jpriv->rx_ring_size, REG_RDLEN);
+	write32(ctrl | BIT(6), REG_CTRL);
+}
+
+static int janis_init_rings(struct janis_private *jpriv)
+{
+	struct net_device *netdev = jpriv->netdev;
+	struct device *dev	  = &jpriv->pdev->dev;
+	int err			  = -ENOMEM;
+
+	void *mem = dma_alloc_coherent(dev, jpriv->rx_ring_size,
+				       &jpriv->dma_handle, GFP_KERNEL);
+	if (!mem)
+		return -ENOMEM;
+
+	jpriv->rx_ring = mem;
+	memset(jpriv->rx_ring, 0, jpriv->rx_ring_size);
+
+	for (int i = 0; i < JANIS_RX_RING_SIZE; i++) {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+
+		skb = netdev_alloc_skb_ip_align(netdev, JANIS_RX_BUF_SIZE);
+		if (!skb)
+			goto err_done;
+
+		mapping = dma_map_single(dev, skb->data, JANIS_RX_BUF_SIZE,
+					 DMA_FROM_DEVICE);
+		if (dma_mapping_error(dev, mapping)) {
+			kfree_skb(skb);
+			goto err_done;
+		}
+
+		jpriv->rx_skb[i]       = skb;
+		jpriv->rx_ring[i].addr = cpu_to_le64(mapping);
+	}
+
+	return 0;
+
+err_done:
+	dma_free_coherent(dev, jpriv->rx_ring_size, jpriv->rx_ring,
+			  jpriv->dma_handle);
+	return err;
+}
+
 static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	printk("janis_probe(%p, %p)\n", pdev, id);
@@ -215,7 +292,10 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		printk(KERN_ERR "failed to map mmio");
 		goto release_region;
 	}
-	jpriv->regs = regs;
+	jpriv->regs	    = regs;
+	jpriv->netdev	    = netdev;
+	jpriv->pdev	    = pdev;
+	jpriv->rx_ring_size = JANIS_RX_RING_SIZE * sizeof(struct janis_rx_desc);
 
 	err = janis_eeprom_to_priv(regs, jpriv);
 	if (err)
@@ -243,10 +323,14 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto io_unmap;
 
 	janis_setup_irqs(jpriv);
+	if (janis_init_rings(jpriv))
+		goto io_unmap;
+	janis_setup_regs(jpriv);
 
+	// TODO: do this when phy reports link up not like this
 	netif_carrier_on(netdev);
 
-	/* TODO: set up mii_if_info struct in jpriv*/
+	/* TODO: set up mii_if_info struct in jpriv */
 	// mii_check_media(&jpriv->mii_if, netif_msg_link(jpriv), true);
 	// netif_start_queue(netdev);
 
