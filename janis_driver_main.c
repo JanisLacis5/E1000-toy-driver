@@ -12,54 +12,61 @@
     Datasheet / manual: https://www.intel.com/content/dam/doc/manual/pci-pci-x-family-gbe-controllers-software-dev-manual.pdf
 */
 
-#define DRIVER_NAME "janis-toy-driver"
-#define JANIS_BAR_L 0
-#define JANIS_BAR_H 1
-#define JANIS_MAX_MTU 1500
-#define JANIS_TMP_BUF_SIZE 256
-#define JANIS_REG_SPACE_SIZE 0x20000 // 128kb
+#define DRIVER_NAME		"janis-toy-driver"
+#define JANIS_BAR_L		0
+#define JANIS_BAR_H		1
+#define JANIS_MAX_MTU		1500
+#define JANIS_TMP_BUF_SIZE	256
+#define JANIS_REG_SPACE_SIZE	0x20000 // 128kb
 #define JANIS_EEPROM_SIZE_WORDS 0x100
 
-// TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
-
-struct rx_desc {
+#define STATUS_PIF   BIT(7)
+#define STATUS_IPCS  BIT(6)
+#define STATUS_TCPCS BIT(5)
+#define STATUS_RSV   BIT(4)
+#define STATUS_VP    BIT(3)
+#define STATUS_IXSM  BIT(2)
+#define STATUS_EOP   BIT(1)
+#define STATUS_DD    BIT(0)
+struct janis_rx_desc {
 	__le64 addr;
 	__le16 len;
 	__le16 checksum;
-	u8 status;
-	u8 errors;
+	u8     status;
+	u8     errors;
 	__le16 special;
 };
 
+// TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
 struct janis_private {
 	void __iomem *regs;
 
 	/* EEPROM data. noone outside the driver is allowed to update it. 
 	   if it is needd for some reason, helpers should be implemented here */
-	u8 mac_addr[ETH_ALEN];
-	u16 compatability[4];
-	u32 pba; // [3rd byte][4th byte][1st byte][2nd byte]
-	u16 init_ctrl1;
-	u16 init_ctrl2;
-	u8 common_pwr;
-	u16 circuit_ctrl;
-	u8 d3_pwr;
-	u8 d0_pwr;
-	u16 mgmt_ctrl;
-	u8 smbus_addr;
-	u8 init_ctrl3;
-	__be32 ipv4;
+	u8		mac_addr[ETH_ALEN];
+	u16		compatability[4];
+	u32		pba; // [3rd byte][4th byte][1st byte][2nd byte]
+	u16		init_ctrl1;
+	u16		init_ctrl2;
+	u8		common_pwr;
+	u16		circuit_ctrl;
+	u8		d3_pwr;
+	u8		d0_pwr;
+	u16		mgmt_ctrl;
+	u8		smbus_addr;
+	u8		init_ctrl3;
+	__be32		ipv4;
 	struct in6_addr ipv6;
-	u8 led_ctrl;
-	u16 checksum;
+	u8		led_ctrl;
+	u16		checksum;
 
 	dma_addr_t dma_handle;
 };
 
-#define read8(pos) readb((jpriv->regs) + (pos))
-#define read16(pos) readw((jpriv->regs) + (pos))
-#define read32(pos) readl((jpriv->regs) + (pos))
-#define write8(pos) writeb((jpriv->regs) + (pos))
+#define read8(pos)   readb((jpriv->regs) + (pos))
+#define read16(pos)  readw((jpriv->regs) + (pos))
+#define read32(pos)  readl((jpriv->regs) + (pos))
+#define write8(pos)  writeb((jpriv->regs) + (pos))
 #define write16(pos) writew((jpriv->regs) + (pos))
 #define write32(pos) writel((jpriv->regs) + (pos))
 
@@ -96,26 +103,26 @@ static int janis_eeprom_to_priv(void __iomem *base, struct janis_private *jpriv)
 	}
 
 	for (int i = 0; i < ETH_ALEN / 2; i++) {
-		jpriv->mac_addr[2 * i] = eeprom[i] & 0xff;
+		jpriv->mac_addr[2 * i]	   = eeprom[i] & 0xff;
 		jpriv->mac_addr[2 * i + 1] = eeprom[i] >> 8;
 	}
 	memcpy(jpriv->compatability, &eeprom[0x03], 4);
-	jpriv->pba = (eeprom[0x09] << 16) | eeprom[0x08];
-	jpriv->init_ctrl1 = eeprom[0x0A];
-	jpriv->init_ctrl2 = eeprom[0x0F];
-	jpriv->common_pwr = eeprom[0x12];
+	jpriv->pba	    = (eeprom[0x09] << 16) | eeprom[0x08];
+	jpriv->init_ctrl1   = eeprom[0x0A];
+	jpriv->init_ctrl2   = eeprom[0x0F];
+	jpriv->common_pwr   = eeprom[0x12];
 	jpriv->circuit_ctrl = eeprom[0x21];
-	jpriv->d3_pwr = eeprom[0x22] & 0xff;
-	jpriv->d0_pwr = eeprom[0x22] >> 8;
-	jpriv->mgmt_ctrl = eeprom[0x23];
-	jpriv->smbus_addr = eeprom[0x24] & 0xff;
-	jpriv->init_ctrl3 = eeprom[0x24] >> 8;
+	jpriv->d3_pwr	    = eeprom[0x22] & 0xff;
+	jpriv->d0_pwr	    = eeprom[0x22] >> 8;
+	jpriv->mgmt_ctrl    = eeprom[0x23];
+	jpriv->smbus_addr   = eeprom[0x24] & 0xff;
+	jpriv->init_ctrl3   = eeprom[0x24] >> 8;
 	for (int i = 0; i < sizeof(__be32) / 2; i++) {
-		ip4[2 * i] = eeprom[0x25 + i] & 0xff;
+		ip4[2 * i]     = eeprom[0x25 + i] & 0xff;
 		ip4[2 * i + 1] = (eeprom[0x25 + i] >> 8);
 	}
 	for (int i = 0; i < sizeof(jpriv->ipv6) / 2; i++) {
-		jpriv->ipv6.s6_addr[2 * i] = eeprom[0x27 + i] & 0xff;
+		jpriv->ipv6.s6_addr[2 * i]     = eeprom[0x27 + i] & 0xff;
 		jpriv->ipv6.s6_addr[2 * i + 1] = (eeprom[0x27 + i] >> 8);
 	}
 	jpriv->led_ctrl = eeprom[0x2F];
@@ -144,16 +151,16 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	printk("janis_probe(%p, %p)\n", pdev, id);
 	struct janis_private *jpriv;
-	struct net_device *netdev;
-	resource_size_t pciaddr;
-	void __iomem *regs;
-	int err;
+	struct net_device    *netdev;
+	resource_size_t	      pciaddr;
+	void __iomem	     *regs;
+	int		      err;
 
 	netdev = alloc_etherdev(sizeof(struct janis_private));
 	if (!netdev)
 		return -ENOMEM;
 	netdev->netdev_ops = &janis_netdev_ops;
-	jpriv = netdev_priv(netdev);
+	jpriv		   = netdev_priv(netdev);
 
 	SET_NETDEV_DEV(netdev, &pdev->dev);
 	pci_set_drvdata(pdev, netdev);
@@ -181,7 +188,7 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto release_region;
 	}
 
-	/* assigns virtual ones so they are accessable */
+	/* assigns virtual ones so they are accessible */
 	regs = ioremap(pciaddr, JANIS_REG_SPACE_SIZE);
 	if (!regs) {
 		err = -EIO;
@@ -194,6 +201,13 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto io_unmap;
 
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (err) {
+		dev_warn(&pdev->dev,
+			 "janis_e1000: No suitable DMA available\n");
+		goto io_unmap;
+	}
+
 	/* set up net device */
 	eth_hw_addr_set(netdev, jpriv->mac_addr);
 	netdev->min_mtu = ETH_MIN_MTU;
@@ -202,15 +216,6 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	err = register_netdev(netdev);
 	if (err)
 		goto io_unmap;
-
-	/* set up dma stuff (TODO) */
-	// see https://docs.kernel.org/core-api/dma-api-howto.html
-	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-	if (err) {
-		dev_warn(&pdev->dev,
-			 "janis_e1000: No suitable DMA available\n");
-		goto io_unmap;
-	}
 
 	/* set up interrups (TODO) */
 	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name,
@@ -235,8 +240,8 @@ err_clean_netdev:
 static void janis_remove(struct pci_dev *pdev)
 {
 	printk("janis_remove(%p)\n", pdev);
-	struct net_device *netdev = pci_get_drvdata(pdev);
-	struct janis_private *jpriv = netdev_priv(netdev);
+	struct net_device    *netdev = pci_get_drvdata(pdev);
+	struct janis_private *jpriv  = netdev_priv(netdev);
 
 	// TODO: stop interrupts from the device first
 	free_irq(pdev->irq, netdev);
@@ -253,10 +258,10 @@ const struct pci_device_id id_table[] = {
 };
 
 static struct pci_driver janis_driver = {
-	.name = DRIVER_NAME,
+	.name	  = DRIVER_NAME,
 	.id_table = id_table,
-	.probe = janis_probe,
-	.remove = janis_remove,
+	.probe	  = janis_probe,
+	.remove	  = janis_remove,
 };
 
 module_pci_driver(janis_driver);
