@@ -3,6 +3,7 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/pci.h>
+#include <linux/mii.h>
 #include <linux/slab.h>
 #include <linux/iopoll.h>
 #include <linux/string.h>
@@ -12,67 +13,78 @@
     Datasheet / manual: https://www.intel.com/content/dam/doc/manual/pci-pci-x-family-gbe-controllers-software-dev-manual.pdf
 */
 
-#define DRIVER_NAME		"janis-toy-driver"
-#define JANIS_BAR_L		0
-#define JANIS_BAR_H		1
+#define DRIVER_NAME "janis-toy-driver"
+
+#define JANIS_BAR		0
 #define JANIS_MAX_MTU		1500
 #define JANIS_TMP_BUF_SIZE	256
 #define JANIS_REG_SPACE_SIZE	0x20000 // 128kb
 #define JANIS_EEPROM_SIZE_WORDS 0x100
 
-#define STATUS_PIF   BIT(7)
-#define STATUS_IPCS  BIT(6)
-#define STATUS_TCPCS BIT(5)
-#define STATUS_RSV   BIT(4)
-#define STATUS_VP    BIT(3)
-#define STATUS_IXSM  BIT(2)
-#define STATUS_EOP   BIT(1)
-#define STATUS_DD    BIT(0)
+#define JANIS_RXDESC_STATUS_PIF	  BIT(7)
+#define JANIS_RXDESC_STATUS_IPCS  BIT(6)
+#define JANIS_RXDESC_STATUS_TCPCS BIT(5)
+#define JANIS_RXDESC_STATUS_RSV	  BIT(4)
+#define JANIS_RXDESC_STATUS_VP	  BIT(3)
+#define JANIS_RXDESC_STATUS_IXSM  BIT(2)
+#define JANIS_RXDESC_STATUS_EOP	  BIT(1)
+#define JANIS_RXDESC_STATUS_DD	  BIT(0)
 struct janis_rx_desc {
 	__le64 addr;
 	__le16 len;
 	__le16 checksum;
-	u8     status;
-	u8     errors;
+	u8 status;
+	u8 errors;
 	__le16 special;
 };
 
 // TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
 struct janis_private {
 	void __iomem *regs;
+	u32 msg_enable;
 
 	/* EEPROM data. noone outside the driver is allowed to update it. 
 	   if it is needd for some reason, helpers should be implemented here */
-	u8		mac_addr[ETH_ALEN];
-	u16		compatability[4];
-	u32		pba; // [3rd byte][4th byte][1st byte][2nd byte]
-	u16		init_ctrl1;
-	u16		init_ctrl2;
-	u8		common_pwr;
-	u16		circuit_ctrl;
-	u8		d3_pwr;
-	u8		d0_pwr;
-	u16		mgmt_ctrl;
-	u8		smbus_addr;
-	u8		init_ctrl3;
-	__be32		ipv4;
+	u8 mac_addr[ETH_ALEN];
+	u16 compatability[4];
+	u32 pba; // [3rd byte][4th byte][1st byte][2nd byte]
+	u16 init_ctrl1;
+	u16 init_ctrl2;
+	u8 common_pwr;
+	u16 circuit_ctrl;
+	u8 d3_pwr;
+	u8 d0_pwr;
+	u16 mgmt_ctrl;
+	u8 smbus_addr;
+	u8 init_ctrl3;
+	__be32 ipv4;
 	struct in6_addr ipv6;
-	u8		led_ctrl;
-	u16		checksum;
+	u8 led_ctrl;
+	u16 checksum;
 
 	dma_addr_t dma_handle;
+	struct mii_if_info mii_if;
 };
 
-#define read8(pos)   readb((jpriv->regs) + (pos))
-#define read16(pos)  readw((jpriv->regs) + (pos))
-#define read32(pos)  readl((jpriv->regs) + (pos))
-#define write8(pos)  writeb((jpriv->regs) + (pos))
-#define write16(pos) writew((jpriv->regs) + (pos))
-#define write32(pos) writel((jpriv->regs) + (pos))
+#define read8(pos)	  readb((jpriv->regs) + (pos))
+#define read16(pos)	  readw((jpriv->regs) + (pos))
+#define read32(pos)	  readl((jpriv->regs) + (pos))
+#define write8(val, pos)  writeb((val), (jpriv->regs) + (pos))
+#define write16(val, pos) writew((val), (jpriv->regs) + (pos))
+#define write32(val, pos) writel((val), (jpriv->regs) + (pos))
 
 enum regs {
 	REG_EECD = 0x10,
 	REG_EERD = 0x14,
+	REG_IMS	 = 0xD0,
+};
+
+enum irqs {
+	IRQ_TXDW   = BIT(0),
+	IRQ_RXDMT0 = BIT(4),
+	IRQ_RX0	   = BIT(6),
+	IRQ_RXT0   = BIT(7),
+	IRQ_SRPD   = BIT(16),
 };
 
 static int janis_read_eeprom_word(void __iomem *base, u8 addr, u16 *ret)
@@ -140,27 +152,35 @@ static irqreturn_t janis_irq(int i, void *data)
 static netdev_tx_t janis_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	printk("janis_xmit(%p, %p)\n", skb, dev);
-	return NETDEV_TX_BUSY;
+	return NETDEV_TX_OK;
 }
 
 static const struct net_device_ops janis_netdev_ops = {
 	.ndo_start_xmit = janis_xmit,
 };
 
+static void janis_setup_irqs(struct janis_private *jpriv)
+{
+	u32 ims = 0;
+	ims |= IRQ_RXT0 | IRQ_SRPD | IRQ_RXDMT0 | IRQ_RX0;
+	write32(ims, REG_IMS);
+}
+
 static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	printk("janis_probe(%p, %p)\n", pdev, id);
 	struct janis_private *jpriv;
-	struct net_device    *netdev;
-	resource_size_t	      pciaddr;
-	void __iomem	     *regs;
-	int		      err;
+	struct net_device *netdev;
+	resource_size_t pciaddr;
+	void __iomem *regs;
+	int err;
 
 	netdev = alloc_etherdev(sizeof(struct janis_private));
 	if (!netdev)
 		return -ENOMEM;
 	netdev->netdev_ops = &janis_netdev_ops;
 	jpriv		   = netdev_priv(netdev);
+	netif_carrier_off(netdev);
 
 	SET_NETDEV_DEV(netdev, &pdev->dev);
 	pci_set_drvdata(pdev, netdev);
@@ -176,13 +196,13 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto disable_dev;
 
 	/* gets pyhsical addresses */
-	pciaddr = pci_resource_start(pdev, JANIS_BAR_L);
+	pciaddr = pci_resource_start(pdev, JANIS_BAR);
 	if (!pciaddr) {
 		printk(KERN_ERR "no mmio resources");
 		err = -EIO;
 		goto release_region;
 	}
-	if (pci_resource_len(pdev, JANIS_BAR_L) < JANIS_REG_SPACE_SIZE) {
+	if (pci_resource_len(pdev, JANIS_BAR) < JANIS_REG_SPACE_SIZE) {
 		printk(KERN_ERR "not enough room for registers");
 		err = -EIO;
 		goto release_region;
@@ -217,11 +237,18 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto io_unmap;
 
-	/* set up interrups (TODO) */
 	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name,
 			  netdev);
 	if (err)
 		goto io_unmap;
+
+	janis_setup_irqs(jpriv);
+
+	netif_carrier_on(netdev);
+
+	/* TODO: set up mii_if_info struct in jpriv*/
+	// mii_check_media(&jpriv->mii_if, netif_msg_link(jpriv), true);
+	// netif_start_queue(netdev);
 
 	return 0;
 
@@ -240,14 +267,14 @@ err_clean_netdev:
 static void janis_remove(struct pci_dev *pdev)
 {
 	printk("janis_remove(%p)\n", pdev);
-	struct net_device    *netdev = pci_get_drvdata(pdev);
-	struct janis_private *jpriv  = netdev_priv(netdev);
+	struct net_device *netdev   = pci_get_drvdata(pdev);
+	struct janis_private *jpriv = netdev_priv(netdev);
 
-	// TODO: stop interrupts from the device first
+	write32(0, REG_IMS);
+	unregister_netdev(netdev);
 	free_irq(pdev->irq, netdev);
 	// TODO: stop all dma operations from the device
-	if (jpriv->regs)
-		iounmap(jpriv->regs);
+	iounmap(jpriv->regs);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
 	free_netdev(netdev);
@@ -255,6 +282,7 @@ static void janis_remove(struct pci_dev *pdev)
 
 const struct pci_device_id id_table[] = {
 	{ PCI_VDEVICE(INTEL, 0x100E) },
+	{},
 };
 
 static struct pci_driver janis_driver = {
