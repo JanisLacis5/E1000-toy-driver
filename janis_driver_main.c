@@ -38,9 +38,19 @@ struct janis_rx_desc {
 	__le16 special;
 };
 
+struct janis_tx_desc {
+	__le64 addr;
+	__le32 len_type_cmd; // contains the first 3 fields
+	u8 status;	     // upper 4 bits are reserved
+	u8 option;
+	__le16 special;
+};
+
 // TODO: define bitmasks to see indvidual bits in fields like init_ctrl etc
 #define JANIS_RX_RING_SIZE 64
 #define JANIS_RX_BUF_SIZE  JANIS_MAX_MTU + ETH_HLEN + 8
+#define JANIS_TX_RING_SIZE 64
+#define JANIS_TX_BUF_SIZE  JANIS_MAX_MTU + ETH_HLEN + 8
 struct janis_private {
 	struct net_device *netdev;
 	struct pci_dev *pdev;
@@ -51,6 +61,12 @@ struct janis_private {
 	struct janis_rx_desc *rx_ring;
 	int rx_ring_size;
 	u32 rx_tail;
+
+	struct sk_buff *tx_skb[JANIS_RX_RING_SIZE];
+	struct janis_tx_desc *tx_ring;
+	int tx_ring_size;
+	u32 tx_head;
+	u32 tx_tail;
 
 	/* EEPROM data. noone outside the driver is allowed to update it. 
 	   if it is needd for some reason, helpers should be implemented here */
@@ -71,7 +87,8 @@ struct janis_private {
 	u8 led_ctrl;
 	u16 checksum;
 
-	dma_addr_t dma_handle;
+	dma_addr_t rx_dma;
+	dma_addr_t tx_dma;
 	struct mii_if_info mii_if;
 };
 
@@ -85,11 +102,16 @@ struct janis_private {
 #define write32(val, pos) writel((val), (jpriv->regs) + (pos))
 
 enum regs {
+	/* General */
 	REG_CTRL = 0x0,
 	REG_STATUS = 0x8,
 	REG_EERD = 0x14,
+
+	/* Interrupt */
 	REG_ICR = 0xC0,
 	REG_IMS = 0xD0,
+
+	/* RX */
 	REG_RCTL = 0x100,
 	REG_RDBAL = 0x2800,
 	REG_RDBAH = 0x2804,
@@ -98,6 +120,14 @@ enum regs {
 	REG_RDT = 0x2818,
 	REG_RAL = 0x5400,
 	REG_RAH = 0x5404,
+
+	/* TX */
+	REG_TCTL = 0x400,
+	REG_TDBAL = 0x3800,
+	REG_TDBAH = 0x3804,
+	REG_TDLEN = 0x3808,
+	REG_TDH = 0x3810,
+	REG_TDT = 0x3818,
 };
 
 enum irqs {
@@ -171,22 +201,18 @@ static irqreturn_t janis_irq(int i, void *data)
 	u32 rx_tail = jpriv->rx_tail;
 	struct janis_rx_desc *desc;
 	struct sk_buff *skb;
+	u32 status;
+	u32 reason;
 
-	u32 reason = read32(REG_ICR);
-	printk("Interrupt reason: %08X\n", reason);
-
-	u32 status = read32(REG_STATUS);
-	printk("device status: %08X\n", status);
+	status = read32(REG_STATUS);
+	reason = read32(REG_ICR);
 
 	desc = &jpriv->rx_ring[rx_tail];
-	printk("curr desc len: %i\n", desc->len);
-	printk("curr desc status: %02X\n", desc->status);
-	printk("curr desc errors: %02X\n", desc->errors);
-	printk("curr desc special: %04X\n", desc->special);
 
 	skb = jpriv->rx_skb[rx_tail];
-	printk("skb len: %i\n", skb->len);
-	printk("skb data len: %i\n", skb->data_len);
+	skb_put(skb, desc->len);
+	print_hex_dump(KERN_DEBUG, "raw data: ", DUMP_PREFIX_ADDRESS, 16, 1,
+		       skb->data, skb->len, true);
 
 	jpriv->rx_tail = RX_TAIL_NEXT(rx_tail);
 	return IRQ_HANDLED;
@@ -203,13 +229,13 @@ static const struct net_device_ops janis_netdev_ops = {
 
 static void janis_setup_irqs(struct janis_private *jpriv)
 {
-	u32 ims = 0;
-	ims |= IRQ_RXT0 | IRQ_SRPD | IRQ_RXDMT0 | IRQ_RX0;
+	u32 ims = IRQ_RXT0 | IRQ_SRPD | IRQ_RXDMT0 | IRQ_RX0;
 	write32(ims, REG_IMS);
 }
 
 static void janis_setup_regs(struct janis_private *jpriv)
 {
+	/* RX */
 	u32 macl = 0;
 	u16 mach = jpriv->mac_addr[4] | (jpriv->mac_addr[5] << 8);
 	for (int i = 0; i < 4; i++) {
@@ -219,23 +245,28 @@ static void janis_setup_regs(struct janis_private *jpriv)
 
 	write32(0b11110, REG_RCTL);
 	write32(0x0, REG_RDH);
-	write32(0x1, REG_RDT);
+	write32(JANIS_RX_RING_SIZE, REG_RDT);
 	write32(macl, REG_RAL);
 	write32(mach, REG_RAH);
-	write32(jpriv->dma_handle & 0xffffffff, REG_RDBAL);
-	write32(jpriv->dma_handle >> 32, REG_RDBAH);
+	write32(jpriv->rx_dma & 0xffffffff, REG_RDBAL);
+	write32(jpriv->rx_dma >> 32, REG_RDBAH);
 	write32(jpriv->rx_ring_size, REG_RDLEN);
 	write32(ctrl | BIT(6), REG_CTRL);
+
+	/* TX */
+	write32(jpriv->tx_dma & 0xffffffff, REG_TDBAL);
+	write32(jpriv->tx_dma >> 32, REG_TDBAH);
+	write32(jpriv->tx_ring_size, REG_TDLEN);
 }
 
-static int janis_init_rings(struct janis_private *jpriv)
+static int janis_init_rx(struct janis_private *jpriv)
 {
 	struct net_device *netdev = jpriv->netdev;
 	struct device *dev = &jpriv->pdev->dev;
 	int err = -ENOMEM;
 
-	void *mem = dma_alloc_coherent(dev, jpriv->rx_ring_size,
-				       &jpriv->dma_handle, GFP_KERNEL);
+	void *mem = dma_alloc_coherent(dev, jpriv->rx_ring_size, &jpriv->rx_dma,
+				       GFP_KERNEL);
 	if (!mem)
 		return -ENOMEM;
 
@@ -265,8 +296,27 @@ static int janis_init_rings(struct janis_private *jpriv)
 
 err_done:
 	dma_free_coherent(dev, jpriv->rx_ring_size, jpriv->rx_ring,
-			  jpriv->dma_handle);
+			  jpriv->rx_dma);
 	return err;
+}
+
+static int janis_init_tx(struct janis_private *jpriv)
+{
+	struct device *dev = &jpriv->pdev->dev;
+
+	void *mem = dma_alloc_coherent(dev, jpriv->tx_ring_size, &jpriv->tx_dma,
+				       GFP_KERNEL);
+	if (!mem)
+		return -ENOMEM;
+
+	jpriv->tx_ring = mem;
+	memset(jpriv->tx_ring, 0, jpriv->tx_ring_size);
+
+	for (int i = 0; i < JANIS_TX_RING_SIZE; i++) {
+		jpriv->tx_ring[i].len_type_cmd = cpu_to_le32(1 << 20);
+	}
+
+	return 0;
 }
 
 static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -322,6 +372,9 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	jpriv->pdev = pdev;
 	jpriv->rx_ring_size = JANIS_RX_RING_SIZE * sizeof(struct janis_rx_desc);
 	jpriv->rx_tail = 0;
+	jpriv->tx_ring_size = JANIS_TX_RING_SIZE * sizeof(struct janis_tx_desc);
+	jpriv->tx_head = 0;
+	jpriv->tx_tail = 0;
 
 	err = janis_eeprom_to_priv(regs, jpriv);
 	if (err)
@@ -348,8 +401,9 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto io_unmap;
 
-	if (janis_init_rings(jpriv))
+	if (janis_init_rx(jpriv) || janis_init_tx(jpriv))
 		goto io_unmap;
+
 	janis_setup_regs(jpriv);
 	janis_setup_irqs(jpriv);
 
@@ -358,7 +412,7 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	/* TODO: set up mii_if_info struct in jpriv */
 	// mii_check_media(&jpriv->mii_if, netif_msg_link(jpriv), true);
-	// netif_start_queue(netdev);
+	netif_start_queue(netdev);
 
 	return 0;
 
@@ -384,8 +438,10 @@ static void janis_remove(struct pci_dev *pdev)
 	free_irq(pdev->irq, netdev);
 	// TODO: stop all dma operations from the device
 	iounmap(jpriv->regs);
-	// dma_free_coherent(&pdev->dev, jpriv->rx_ring_size, jpriv->rx_ring,
-	// 		  jpriv->dma_handle);
+	dma_free_coherent(&pdev->dev, jpriv->rx_ring_size, jpriv->rx_ring,
+			  jpriv->rx_dma);
+	dma_free_coherent(&pdev->dev, jpriv->tx_ring_size, jpriv->tx_ring,
+			  jpriv->tx_dma);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
 	free_netdev(netdev);
