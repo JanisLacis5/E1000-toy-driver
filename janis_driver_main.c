@@ -1,6 +1,7 @@
 #include "linux/if_ether.h"
 #include "linux/in6.h"
 #include <linux/netdevice.h>
+#include <linux/container_of.h>
 #include <linux/etherdevice.h>
 #include <linux/pci.h>
 #include <linux/mii.h>
@@ -52,6 +53,7 @@ struct janis_tx_desc {
 #define JANIS_TX_RING_SIZE 64
 #define JANIS_TX_BUF_SIZE  JANIS_MAX_MTU + ETH_HLEN + 8
 struct janis_private {
+	struct napi_struct janis_napi;
 	struct net_device *netdev;
 	struct pci_dev *pdev;
 	void __iomem *regs;
@@ -145,8 +147,7 @@ static int janis_read_eeprom_word(void __iomem *base, u8 addr, u16 *ret)
 	u32 to_write = (addr << 8) | 1;
 	writel(to_write, base + REG_EERD);
 
-	if (readl_poll_timeout(base + REG_EERD, eerd_value,
-			       eerd_value & (1u << 4), 0, 100))
+	if (readl_poll_timeout(base + REG_EERD, eerd_value, eerd_value & (1u << 4), 0, 100))
 		return -ETIMEDOUT;
 
 	*ret = eerd_value >> 0x10;
@@ -198,23 +199,8 @@ static irqreturn_t janis_irq(int i, void *data)
 {
 	struct net_device *netdev = data;
 	struct janis_private *jpriv = netdev_priv(netdev);
-	u32 rx_tail = jpriv->rx_tail;
-	struct janis_rx_desc *desc;
-	struct sk_buff *skb;
-	u32 status;
-	u32 reason;
 
-	status = read32(REG_STATUS);
-	reason = read32(REG_ICR);
-
-	desc = &jpriv->rx_ring[rx_tail];
-
-	skb = jpriv->rx_skb[rx_tail];
-	skb_put(skb, desc->len);
-	print_hex_dump(KERN_DEBUG, "raw data: ", DUMP_PREFIX_ADDRESS, 16, 1,
-		       skb->data, skb->len, true);
-
-	jpriv->rx_tail = RX_TAIL_NEXT(rx_tail);
+	napi_schedule(&jpriv->janis_napi);
 	return IRQ_HANDLED;
 }
 
@@ -265,8 +251,7 @@ static int janis_init_rx(struct janis_private *jpriv)
 	struct device *dev = &jpriv->pdev->dev;
 	int err = -ENOMEM;
 
-	void *mem = dma_alloc_coherent(dev, jpriv->rx_ring_size, &jpriv->rx_dma,
-				       GFP_KERNEL);
+	void *mem = dma_alloc_coherent(dev, jpriv->rx_ring_size, &jpriv->rx_dma, GFP_KERNEL);
 	if (!mem)
 		return -ENOMEM;
 
@@ -277,12 +262,12 @@ static int janis_init_rx(struct janis_private *jpriv)
 		struct sk_buff *skb;
 		dma_addr_t mapping;
 
-		skb = netdev_alloc_skb_ip_align(netdev, JANIS_RX_BUF_SIZE);
+		skb = netdev_alloc_skb(netdev, JANIS_RX_BUF_SIZE);
 		if (!skb)
 			goto err_done;
+		skb->dev = netdev;
 
-		mapping = dma_map_single(dev, skb->data, JANIS_RX_BUF_SIZE,
-					 DMA_FROM_DEVICE);
+		mapping = dma_map_single(dev, skb->data, JANIS_RX_BUF_SIZE, DMA_FROM_DEVICE);
 		if (dma_mapping_error(dev, mapping)) {
 			kfree_skb(skb);
 			goto err_done;
@@ -295,8 +280,7 @@ static int janis_init_rx(struct janis_private *jpriv)
 	return 0;
 
 err_done:
-	dma_free_coherent(dev, jpriv->rx_ring_size, jpriv->rx_ring,
-			  jpriv->rx_dma);
+	dma_free_coherent(dev, jpriv->rx_ring_size, jpriv->rx_ring, jpriv->rx_dma);
 	return err;
 }
 
@@ -304,8 +288,7 @@ static int janis_init_tx(struct janis_private *jpriv)
 {
 	struct device *dev = &jpriv->pdev->dev;
 
-	void *mem = dma_alloc_coherent(dev, jpriv->tx_ring_size, &jpriv->tx_dma,
-				       GFP_KERNEL);
+	void *mem = dma_alloc_coherent(dev, jpriv->tx_ring_size, &jpriv->tx_dma, GFP_KERNEL);
 	if (!mem)
 		return -ENOMEM;
 
@@ -317,6 +300,41 @@ static int janis_init_tx(struct janis_private *jpriv)
 	}
 
 	return 0;
+}
+
+static void janis_process_tx(void)
+{
+}
+
+static int janis_poll(struct napi_struct *napi, int budget)
+{
+	struct janis_private *jpriv = container_of(napi, struct janis_private, janis_napi);
+	struct net_device *netdev = jpriv->netdev;
+	u32 rx_tail = jpriv->rx_tail;
+	struct janis_rx_desc *desc;
+	struct sk_buff *skb;
+	int received = 0;
+	u32 status;
+	u32 reason;
+
+	janis_process_tx();
+
+	while (received < budget) {
+		status = read32(REG_STATUS);
+		reason = read32(REG_ICR);
+
+		desc = &jpriv->rx_ring[rx_tail];
+		skb = jpriv->rx_skb[rx_tail];
+		skb_put(skb, desc->len);
+		print_hex_dump(KERN_DEBUG, "raw data: ", DUMP_PREFIX_ADDRESS, 16, 1, skb->data,
+			       skb->len, true);
+		skb->protocol = eth_type_trans(skb, netdev);
+
+		jpriv->rx_tail = RX_TAIL_NEXT(rx_tail);
+		received++;
+	}
+
+	return received;
 }
 
 static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -382,8 +400,7 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err) {
-		dev_warn(&pdev->dev,
-			 "janis_e1000: No suitable DMA available\n");
+		dev_warn(&pdev->dev, "janis_e1000: No suitable DMA available\n");
 		goto io_unmap;
 	}
 
@@ -396,8 +413,7 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto io_unmap;
 
-	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name,
-			  netdev);
+	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name, netdev);
 	if (err)
 		goto io_unmap;
 
@@ -412,6 +428,8 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	/* TODO: set up mii_if_info struct in jpriv */
 	// mii_check_media(&jpriv->mii_if, netif_msg_link(jpriv), true);
+	netif_napi_add(netdev, &jpriv->janis_napi, janis_poll);
+	napi_enable(&jpriv->janis_napi);
 	netif_start_queue(netdev);
 
 	return 0;
@@ -438,10 +456,8 @@ static void janis_remove(struct pci_dev *pdev)
 	free_irq(pdev->irq, netdev);
 	// TODO: stop all dma operations from the device
 	iounmap(jpriv->regs);
-	dma_free_coherent(&pdev->dev, jpriv->rx_ring_size, jpriv->rx_ring,
-			  jpriv->rx_dma);
-	dma_free_coherent(&pdev->dev, jpriv->tx_ring_size, jpriv->tx_ring,
-			  jpriv->tx_dma);
+	dma_free_coherent(&pdev->dev, jpriv->rx_ring_size, jpriv->rx_ring, jpriv->rx_dma);
+	dma_free_coherent(&pdev->dev, jpriv->tx_ring_size, jpriv->tx_ring, jpriv->tx_dma);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
 	free_netdev(netdev);
