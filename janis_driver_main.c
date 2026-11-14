@@ -311,30 +311,40 @@ static int janis_poll(struct napi_struct *napi, int budget)
 {
 	struct janis_private *jpriv = container_of(napi, struct janis_private, janis_napi);
 	struct net_device *netdev = jpriv->netdev;
-	u32 rx_tail = jpriv->rx_tail;
 	struct janis_rx_desc *desc;
+	struct sk_buff *napi_skb;
 	struct sk_buff *skb;
 	int received = 0;
+	u32 rx_tail;
 	u32 status;
 	u32 reason;
 
 	janis_process_tx();
 
 	while (received < budget) {
+		rx_tail = jpriv->rx_tail;
 		status = read32(REG_STATUS);
 		reason = read32(REG_ICR);
 
 		desc = &jpriv->rx_ring[rx_tail];
+		if ((desc->status & BIT(0)) == 0)
+			break;
+
+		napi_skb = napi_alloc_skb(&jpriv->janis_napi, desc->len);
+		if (!napi_skb)
+			break;
+
 		skb = jpriv->rx_skb[rx_tail];
-		skb_put(skb, desc->len);
-		print_hex_dump(KERN_DEBUG, "raw data: ", DUMP_PREFIX_ADDRESS, 16, 1, skb->data,
-			       skb->len, true);
-		skb->protocol = eth_type_trans(skb, netdev);
+		napi_skb->protocol = eth_type_trans(skb, netdev);
+		skb_put_data(napi_skb, skb->data, desc->len);
+		netif_receive_skb(napi_skb);
 
 		jpriv->rx_tail = RX_TAIL_NEXT(rx_tail);
 		received++;
 	}
 
+	if (received < budget)
+		napi_complete_done(&jpriv->janis_napi, received);
 	return received;
 }
 
@@ -399,7 +409,6 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	err = janis_eeprom_to_priv(regs, jpriv);
 	if (err)
 		goto io_unmap;
-
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err) {
 		dev_warn(&pdev->dev, "janis_e1000: No suitable DMA available\n");
