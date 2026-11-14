@@ -70,6 +70,7 @@ struct janis_private {
 	u32 tx_head;
 	u32 tx_tail;
 
+	// TODO: probably remove, likely wont be used
 	/* EEPROM data. noone outside the driver is allowed to update it. 
 	   if it is needd for some reason, helpers should be implemented here */
 	u8 mac_addr[ETH_ALEN];
@@ -385,6 +386,7 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		printk(KERN_ERR "failed to map mmio");
 		goto release_region;
 	}
+
 	jpriv->regs = regs;
 	jpriv->netdev = netdev;
 	jpriv->pdev = pdev;
@@ -413,11 +415,11 @@ static int janis_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (err)
 		goto io_unmap;
 
-	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name, netdev);
-	if (err)
+	if (janis_init_rx(jpriv) || janis_init_tx(jpriv))
 		goto io_unmap;
 
-	if (janis_init_rx(jpriv) || janis_init_tx(jpriv))
+	err = request_irq(pdev->irq, janis_irq, IRQF_SHARED, netdev->name, netdev);
+	if (err)
 		goto io_unmap;
 
 	janis_setup_regs(jpriv);
